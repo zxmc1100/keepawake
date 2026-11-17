@@ -4,6 +4,9 @@ Menu bar app (no Dock icon) that keeps a Mac **running with the lid closed**, on
 the display off and the screen locked. It can stay on until you turn it off, or only while a
 chosen window or app is open.
 
+It also shows what your charger is giving the Mac (for example `30W (20V × 1.5A)`) and warns you
+when a charger is bad for it: too weak, 5V-only, unstable or delivering the wrong voltage.
+
 ## Install
 
 Requires macOS 13 or later and Xcode or the Command Line Tools. There's no prebuilt download, so
@@ -17,6 +20,7 @@ cd keepawake
 
 Builds, runs the checks, installs to `/Applications` and launches. Look for the bolt icon. The
 first time you turn on Keep Awake, macOS asks for your password once to install a small helper.
+The first charger warning asks permission to show notifications.
 
 ## Menu
 
@@ -27,9 +31,21 @@ first time you turn on Keep Awake, macOS asks for your password once to install 
 | **Until *App* Quits** | Same, for the whole app. Ends as soon as it quits. |
 | **Reconnect Wi-Fi Automatically** | If you go offline, gets macOS to search for and join known networks. |
 | **Launch at Login** | On by default, because Wi-Fi reconnect only works while the app runs. |
+| **Charger** (only when plugged in) | What the charger offers (e.g. `30W (20V × 1.5A) max`), what it's delivering now and how that splits between running the Mac and charging the battery, and every voltage it supports. Info only. |
+| **⚠︎ / ⛔︎ charger warnings** | Shown at the top of the menu, with a tip, only when something is wrong. Each one also sends a notification once. |
 
-The icon is a dimmed `bolt` when off, `bolt.fill` when on, and a warning triangle when something failed. If
-it shows, open the menu to read why.
+The icon is a dimmed `bolt` when off, `bolt.fill` when on, and a warning triangle when something failed
+or a charger is bad for the Mac. If it shows, open the menu to read why.
+
+### Charger warnings
+
+| | When |
+|---|---|
+| ⛔︎ | Input voltage more than 10% above what the charger agreed to · the charger connects 3 times in a minute · battery at 45°C or more |
+| ⚠︎ | 5V-only charger · under 30W · battery draining while power flows in · voltage sagging more than 15% under load · the Mac running hot while charging · battery at 40°C or more |
+
+A warning must last 4 s before it shows, so the steps a charger goes through while negotiating don't
+trigger one. Nothing wrong means nothing shown.
 
 If the lid is closed when Keep Awake ends, the Mac goes to sleep at once, unless it's docked to an
 external display.
@@ -41,6 +57,9 @@ are system events. The only timers are:
 
 - **Window tie:** one 10 s check costing about 0.15 ms, only while tied to a window.
 - **Wi-Fi retry:** a scan at 15 s, 30 s, 1 min and so on up to every 5 min, only while offline.
+- **Charger:** no timer. It reads the battery registry when macOS reports a power change or publishes
+  its own battery update (about once a minute), plus one re-check 5 s later while a warning is being
+  confirmed. Measured: about 1 idle wakeup a minute.
 
 For the whole Mac on battery with the lid closed, I measured 0.99 W once the display was off and the
 screen locked. It can be well above that until the display timer fires, and whenever apps are busy:
@@ -71,6 +90,12 @@ battery (`pmset -g custom` shows `lowpowermode`). A bag has no airflow, so a bus
   timer), and your "Require password" delay can add more time before a password is needed. To shorten
   that gap, lower those two settings or lock by hand (⌃⌘Q) before closing the lid.
 
+- **Charger:** read from IOKit (`AppleSmartBattery` and `IOPSCopyExternalPowerAdapterDetails`), no root
+  needed. The charger's offer (its USB-PD contract and supported voltages) is known the moment it's
+  plugged in. What it's delivering comes from macOS telemetry, which refreshes about once a minute,
+  so right after plugging in the menu says "measuring…". Readings taken before the current charger
+  was plugged in are ignored, so swapping chargers can't raise a false voltage alarm.
+
 ## Limits
 
 - Window names aren't shown: reading them needs the Screen Recording or Accessibility permission.
@@ -79,6 +104,11 @@ battery (`pmset -g custom` shows `lowpowermode`). A bag has no airflow, so a bus
   accepts Wi-Fi won't trigger a search.
 - Disconnecting by hand from the Wi-Fi menu can stop macOS rejoining that network until you pick it
   again.
+- Charger warnings use general limits (30W minimum), not your Mac model's own charger rating.
+- macOS 27 no longer publishes the battery temperature, so there the heat warning relies on the
+  system's thermal state. The 40°C and 45°C checks only work on versions that publish it.
+- Right after plugging in, macOS can wait about a minute before it starts using the charger; the
+  menu shows "measuring…" until then.
 
 ## Live test
 
@@ -126,11 +156,14 @@ Developed and tested on one Apple Silicon Mac running macOS 27, so other setups 
 - **Tested live:** menu, staying awake on battery with the lid closed, macOS locking by itself with
   Keep Awake on, ending when a tied window closes, joining an iPhone hotspot with no clicks while
   unlocked, and that hotspot staying connected once locked. Known Wi-Fi rejoined after real signal
-  loss, and the log shows the app's scan triggering macOS auto-join at least once.
+  loss, and the log shows the app's scan triggering macOS auto-join at least once. Charger readings
+  with an 18W third-party charger and a Ugreen 30W charger, matching the voltages printed on it.
 - **Tested automatically:** sleep is restored after a normal exit, `SIGKILL`, `SIGTERM` and an early
-  disconnect (`test_guard.sh`).
+  disconnect (`test_guard.sh`). The charger rules run against real readings from those two chargers
+  in `--selfcheck`.
 - **Not tested:** the iPhone hotspot starting with the lid closed before the lock, and sleeping when a
-  tie ends with the lid closed.
+  tie ends with the lid closed. Charger warnings for overvoltage, sagging and flapping are only tested
+  with recorded readings, not with a faulty charger.
 
 ## License
 

@@ -1,9 +1,13 @@
-// KeepAwake: menu bar app that keeps the Mac running with the lid closed and rejoins
-// known Wi-Fi. macOS itself does the locking. Everything is event-driven; see README.md.
+// KeepAwake: menu bar app that keeps the Mac running with the lid closed, rejoins known Wi-Fi
+// and shows what the charger delivers. macOS itself does the locking. Everything is event-driven;
+// see README.md.
 import AppKit
 import CoreWLAN
+import IOKit
+import IOKit.ps
 import Network
 import ServiceManagement
+import UserNotifications
 import os
 
 let guardLabel = "com.zxmc.keepawake.guard"
@@ -177,6 +181,11 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private var activity: NSObjectProtocol?
 
+    private var charger = ChargerReading(battery: [:], adapter: nil, thermal: .nominal)
+    private var chargerAlerts = ChargerAlerts()
+    private var chargerRecheck: DispatchWorkItem?
+    private var batteryWatch: io_object_t = 0
+
     private var wifiEnabled: Bool { defaults.bool(forKey: "reconnectWiFi") }
 
     func applicationDidFinishLaunching(_ note: Notification) {
@@ -197,6 +206,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.delegate = self
         statusItem.menu = menu
         updateIcon()
+        watchCharger()
 
         if wifiEnabled {
             startWiFiMonitor()
@@ -206,12 +216,13 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func updateIcon() {
-        let symbol = problem != nil ? "exclamationmark.triangle" : (awakeSince != nil ? "bolt.fill" : "bolt")
-        let description = problem ?? (awakeSince != nil ? "KeepAwake: on" : "KeepAwake: off")
+        let warning = problem ?? chargerAlerts.active.first?.title
+        let symbol = warning != nil ? "exclamationmark.triangle" : (awakeSince != nil ? "bolt.fill" : "bolt")
+        let description = warning ?? (awakeSince != nil ? "KeepAwake: on" : "KeepAwake: off")
         statusItem.button?.image = NSImage(systemSymbolName: symbol, accessibilityDescription: description)?
             .withSymbolConfiguration(.init(pointSize: 11, weight: .regular))
         statusItem.button?.image?.isTemplate = true
-        statusItem.button?.appearsDisabled = problem == nil && awakeSince == nil // stay quiet in the menu bar when off
+        statusItem.button?.appearsDisabled = warning == nil && awakeSince == nil // stay quiet in the menu bar when off
         statusItem.button?.toolTip = description
     }
 
@@ -219,15 +230,18 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
-        func add(_ title: String, _ action: Selector? = nil, on: Bool = false, key: String = "") {
+        func add(_ title: String, _ action: Selector? = nil, on: Bool = false, key: String = "", subtitle: String? = nil) {
             let item = NSMenuItem(title: title, action: action, keyEquivalent: key)
             item.target = self
             item.state = on ? .on : .off
             item.isEnabled = action != nil
+            if #available(macOS 14.4, *) { item.subtitle = subtitle }
             menu.addItem(item)
         }
 
+        chargerChanged() // fresh reading for the charger lines below
         if let problem { add("⚠︎ \(problem)") }
+        for issue in chargerAlerts.active { add((issue.danger ? "⛔︎ " : "⚠︎ ") + issue.title, subtitle: issue.tip) }
         if let awakeSince {
             let time = awakeSince.formatted(date: .omitted, time: .shortened)
             add("Awake since \(time)" + (tie.map { ", \($0.summary)" } ?? ""))
@@ -244,6 +258,22 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
             add("Until This \(name) Window Closes", window != nil ? #selector(tieToWindow) : nil, on: isTiedToWindow)
             add("Until \(name) Quits", #selector(tieToApp), on: isTiedToApp)
+        }
+
+        if charger.connected {
+            menu.addItem(.separator())
+            add("\(charger.name ?? "Charger"): " + (charger.contractText.map { "\($0) max" } ?? "connected"))
+            if let watts = charger.inWatts, let live = charger.liveText {
+                let mac = fmt(max(0, watts - charger.battWatts), 1), battery = fmt(abs(charger.battWatts), 1)
+                add("Using \(live)", subtitle: charger.battWatts >= 0
+                    ? "\(mac)W runs the Mac, \(battery)W charges the battery"
+                    : "The Mac uses \(mac)W, \(battery)W of it from the battery")
+            } else {
+                add("Using: measuring…", subtitle: "macOS updates this about once a minute")
+            }
+            if !charger.offers.isEmpty {
+                add("Supports " + charger.offers.map { "\(fmt($0.volts, 1))V \(fmt($0.amps))A" }.joined(separator: " · "))
+            }
         }
 
         menu.addItem(.separator())
@@ -442,6 +472,222 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             problem = "Launch at Login failed: \(error.localizedDescription)"
         }
     }
+
+    // MARK: Charger
+
+    // Plug, unplug and charger changes, plus the battery update macOS publishes about once a minute.
+    // Nothing polls: each event costs one registry read.
+    private func watchCharger() {
+        let context = Unmanaged.passUnretained(self).toOpaque()
+        let powerSources = IOPSNotificationCreateRunLoopSource({ context in
+            Unmanaged<App>.fromOpaque(context!).takeUnretainedValue().chargerChanged()
+        }, context).takeRetainedValue()
+        CFRunLoopAddSource(CFRunLoopGetMain(), powerSources, .defaultMode)
+
+        let port = IONotificationPortCreate(kIOMainPortDefault)
+        IONotificationPortSetDispatchQueue(port, .main)
+        let battery = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleSmartBattery"))
+        IOServiceAddInterestNotification(port, battery, kIOGeneralInterest, { context, _, _, _ in
+            Unmanaged<App>.fromOpaque(context!).takeUnretainedValue().chargerChanged()
+        }, context, &batteryWatch)
+        IOObjectRelease(battery)
+        chargerChanged()
+    }
+
+    private func chargerChanged() {
+        var reading = ChargerReading.read()
+        for issue in chargerAlerts.update(&reading) { notify(issue) }
+        charger = reading
+        updateIcon()
+        // A warning is only confirmed once it has lasted 4 s, so look once more when one is waiting.
+        chargerRecheck?.cancel()
+        guard chargerAlerts.pending else { return }
+        let work = DispatchWorkItem { [weak self] in self?.chargerChanged() }
+        chargerRecheck = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5, execute: work)
+    }
+
+    private func notify(_ issue: ChargerIssue) {
+        let content = UNMutableNotificationContent()
+        content.title = (issue.danger ? "⛔️ " : "⚠️ ") + issue.title
+        content.body = issue.tip
+        content.sound = .default
+        let center = UNUserNotificationCenter.current()
+        // Asks once, then answers at once; posting after the answer keeps the very first warning.
+        center.requestAuthorization(options: [.alert, .sound]) { granted, _ in
+            if granted { center.add(UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)) }
+        }
+    }
+}
+
+// MARK: Charger readings (info only)
+
+// What the charger offers (its USB-PD contract, known the moment it's plugged in) and what it
+// delivers (macOS telemetry, refreshed about once a minute), plus warnings when it's bad for the Mac.
+// Units: volts, amps, watts, °C.
+struct ChargerReading {
+    var connected = false
+    var name: String?
+    var watts: Double?
+    var volts: Double?
+    var amps: Double?
+    var offers: [(volts: Double, amps: Double)] = []
+    var inVolts: Double?
+    var inAmps: Double?
+    var battVolts = 0.0
+    var battAmps = 0.0 // > 0 charging, < 0 draining
+    var tempC: Double?
+    var thermal: ProcessInfo.ThermalState = .nominal
+    var updated: Date? // when macOS last refreshed the telemetry
+
+    var battWatts: Double { battVolts * battAmps }
+    var inWatts: Double? {
+        guard let v = inVolts, let a = inAmps, v > 0, a > 0 else { return nil }
+        return v * a
+    }
+    var contractText: String? {
+        guard let v = volts, let a = amps else { return watts.map { "\(fmt($0, 0))W" } }
+        return "\(fmt(watts ?? v * a, 0))W (\(fmt(v, 1))V × \(fmt(a))A)"
+    }
+    var liveText: String? {
+        guard let w = inWatts, let v = inVolts, let a = inAmps else { return nil }
+        return "\(fmt(w, 1))W (\(fmt(v, 1))V × \(fmt(a))A)"
+    }
+
+    static func read() -> ChargerReading {
+        let battery = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleSmartBattery"))
+        defer { IOObjectRelease(battery) }
+        var properties: Unmanaged<CFMutableDictionary>?
+        IORegistryEntryCreateCFProperties(battery, &properties, kCFAllocatorDefault, 0)
+        let adapter = IOPSCopyExternalPowerAdapterDetails()?.takeRetainedValue() as? [String: Any]
+        return ChargerReading(battery: properties?.takeRetainedValue() as? [String: Any] ?? [:], adapter: adapter,
+                              thermal: ProcessInfo.processInfo.thermalState)
+    }
+
+    // AppleSmartBattery properties and IOPS adapter details, in mV, mA and W.
+    init(battery: [String: Any], adapter: [String: Any]?, thermal: ProcessInfo.ThermalState) {
+        // IOKit reports signed values such as Amperage as unsigned 64-bit; int64Value restores the sign.
+        func number(_ d: [String: Any]?, _ key: String) -> Double? { (d?[key] as? NSNumber).map { Double($0.int64Value) } }
+        self.thermal = thermal
+        connected = battery["ExternalConnected"] as? Bool ?? false
+        battVolts = (number(battery, "Voltage") ?? 0) / 1000
+        battAmps = (number(battery, "Amperage") ?? 0) / 1000
+        updated = number(battery, "UpdateTime").map { Date(timeIntervalSince1970: $0) }
+        tempC = (number(battery, "Temperature") ?? number(battery, "VirtualTemperature")).map { $0 / 100 } // gone on macOS 27
+        guard connected else { return }
+
+        var details = battery["AdapterDetails"] as? [String: Any] ?? [:]
+        details.merge(adapter ?? [:]) { $1 }
+        name = details["Name"] as? String
+        watts = number(details, "Watts").flatMap { $0 > 0 ? $0 : nil }
+        volts = (number(details, "AdapterVoltage") ?? number(details, "Voltage")).flatMap { $0 > 0 ? $0 / 1000 : nil }
+        amps = number(details, "Current").flatMap { $0 > 0 ? $0 / 1000 : nil }
+        offers = (details["UsbHvcMenu"] as? [[String: Any]] ?? []).compactMap {
+            guard let v = number($0, "MaxVoltage"), let a = number($0, "MaxCurrent") else { return nil }
+            return (v / 1000, a / 1000)
+        }
+        let telemetry = battery["PowerTelemetryData"] as? [String: Any]
+        inVolts = number(telemetry, "SystemVoltageIn").map { $0 / 1000 }
+        inAmps = number(telemetry, "SystemCurrentIn").map { $0 / 1000 }
+    }
+
+    // Problems in this one reading, dangers first.
+    var issues: [ChargerIssue] {
+        guard connected else { return [] }
+        var out: [ChargerIssue] = []
+        if let v = volts, let measured = inVolts, measured > 0 {
+            if measured > v * 1.1 {
+                out.append(ChargerIssue(id: "overvolt", danger: true, title: "Voltage too high: \(fmt(measured, 1))V on a \(fmt(v, 1))V charger",
+                                        tip: "The charger is sending more voltage than it agreed to. Unplug it now: it may be faulty."))
+            } else if measured < v * 0.85, (inAmps ?? 0) > 0.5 {
+                out.append(ChargerIssue(id: "sag", danger: false, title: "Voltage dropping: \(fmt(measured, 1))V of \(fmt(v, 1))V",
+                                        tip: "The charger or cable can't hold its voltage under load. Try another cable (short, 100W/e-marked) or charger."))
+            }
+        }
+        if let v = volts, v <= 5.5 {
+            out.append(ChargerIssue(id: "5v", danger: false, title: "5V-only charger (\(contractText ?? "?"))",
+                                    tip: "A phone-style charger with no USB-PD fast charging. The Mac charges very slowly or drains. Use a USB-C PD charger of 30W or more."))
+        } else if let w = watts, w < 30 {
+            out.append(ChargerIssue(id: "lowwatt", danger: false, title: "Low-power charger (\(fmt(w, 0))W)",
+                                    tip: "Too weak for a MacBook under load: expect slow charging or drain. Use 30W or more, ideally the wattage your Mac came with."))
+        }
+        // Only while power really flows in: right after plug-in macOS can wait about a minute before using the charger.
+        if battAmps < -0.1, inWatts != nil {
+            out.append(ChargerIssue(id: "drain", danger: false, title: "Battery draining while plugged in (\(fmt(-battWatts, 1))W)",
+                                    tip: "The charger can't keep up with the Mac. Use a stronger charger or close heavy apps."))
+        }
+        if let t = tempC, t >= 40 {
+            out.append(ChargerIssue(id: "temp", danger: t >= 45, title: "Battery \(t >= 45 ? "hot" : "warm") (\(fmt(t, 1))°C)",
+                                    tip: t >= 45 ? "Unplug and let the Mac cool down." : "Charging while warm wears the battery. Give it airflow or unplug."))
+        }
+        if thermal == .serious || thermal == .critical {
+            out.append(ChargerIssue(id: "hot", danger: false, title: "Mac is running hot while charging",
+                                    tip: "Heat plus charging ages the battery fastest. Unplug or give it airflow."))
+        }
+        return out.filter(\.danger) + out.filter { !$0.danger }
+    }
+}
+
+struct ChargerIssue {
+    let id: String
+    let danger: Bool
+    let title: String
+    let tip: String
+}
+
+// Turns readings into warnings. Each must last 4 s, because a charger steps through 5V while it
+// negotiates; readings taken before the current charger settled in are ignored, because they
+// belong to the previous one; and each warning notifies once until it clears.
+struct ChargerAlerts {
+    private(set) var active: [ChargerIssue] = []
+    private var since: [String: Date] = [:]
+    private var notified: Set<String> = []
+    private var connects: [Date] = []
+    private var started = false
+    private var wasConnected = false
+    private var contract: String?
+    private var contractSince = Date.distantPast
+
+    var pending: Bool { since.count > active.count }
+
+    // Returns the warnings to notify about, and blanks live readings in `reading` that predate the charger.
+    mutating func update(_ reading: inout ChargerReading, now: Date = Date()) -> [ChargerIssue] {
+        if reading.connected {
+            if started && !wasConnected { connects.append(now) }
+            if reading.contractText != contract {
+                contract = reading.contractText
+                contractSince = started ? now : .distantPast // already plugged in at launch: its readings are current
+            }
+        } else {
+            contract = nil
+        }
+        started = true
+        wasConnected = reading.connected
+        connects.removeAll { now.timeIntervalSince($0) > 60 }
+        if reading.connected, let updated = reading.updated, updated.timeIntervalSince(contractSince) < 20 {
+            reading.inVolts = nil
+            reading.inAmps = nil
+        }
+
+        var found = reading.issues
+        if connects.count >= 3 {
+            found.insert(ChargerIssue(id: "flapping", danger: true, title: "Charger keeps disconnecting",
+                                      tip: "A loose cable or port, or a failing charger. Unplug it and try another cable or charger."), at: 0)
+        }
+        let ids = Set(found.map(\.id))
+        since = since.filter { ids.contains($0.key) }
+        for id in ids where since[id] == nil { since[id] = now }
+        active = found.filter { now.timeIntervalSince(since[$0.id]!) >= 4 }
+        notified.formIntersection(active.map(\.id))
+        return active.filter { notified.insert($0.id).inserted }
+    }
+}
+
+// Locale-independent number: up to `digits` decimals, trailing zeros trimmed.
+func fmt(_ x: Double, _ digits: Int = 2) -> String {
+    var s = String(format: "%.\(digits)f", x)
+    while s.contains("."), s.hasSuffix("0") || s.hasSuffix(".") { s.removeLast() }
+    return s == "-0" ? "0" : s
 }
 
 // Run by install.sh before anything is installed.
@@ -458,6 +704,8 @@ func selfCheck() {
     precondition(listener["SockPathMode"] as? Int == 0o600 && listener["SockPathOwner"] as? Int == 501, "socket restricted to the user")
     precondition(plists.map(\.data) == daemonPlists(uid: 501).map(\.data), "plist bytes stable, or every launch would re-prompt")
 
+    chargerCheck()
+
     // A real window through the real checks, off screen.
     NSApplication.shared.setActivationPolicy(.prohibited)
     var window: NSWindow? = NSWindow(contentRect: NSRect(x: 40, y: 40, width: 200, height: 200), styleMask: .borderless, backing: .buffered, defer: false)
@@ -473,6 +721,78 @@ func selfCheck() {
     // A close only commits with a running event loop, so "closed" is proven by the live test in the README.
     precondition(!windowExists(99_999_999), "unknown window is gone")
     print("selfcheck ok")
+}
+
+// Real readings from a MacBook Pro (Mac16,1), in IOKit's own units and encodings.
+func chargerCheck() {
+    func battery(amps: Int, vin: Int = 0, iin: Int = 0, adapter: [String: Any], connected: Bool = true, updated: Int? = nil) -> [String: Any] {
+        var b: [String: Any] = [
+            "ExternalConnected": connected, "Voltage": 11888,
+            "Amperage": NSNumber(value: UInt64(bitPattern: Int64(amps))), // negative mA arrive as unsigned 64-bit
+            "PowerTelemetryData": ["SystemVoltageIn": vin, "SystemCurrentIn": iin],
+            "AdapterDetails": adapter,
+        ]
+        b["UpdateTime"] = updated
+        return b
+    }
+    func menu(_ offers: [[Int]]) -> [[String: Any]] { offers.map { ["MaxVoltage": $0[0], "MaxCurrent": $0[1]] } }
+    func reading(_ b: [String: Any], thermal: ProcessInfo.ThermalState = .nominal) -> ChargerReading {
+        ChargerReading(battery: b, adapter: nil, thermal: thermal)
+    }
+    let ugreen30: [String: Any] = ["AdapterVoltage": 20000, "Watts": 30, "Current": 1500, "Description": "pd charger",
+                                   "UsbHvcMenu": menu([[5000, 3000], [9000, 3000], [12000, 2500], [15000, 2000], [20000, 1500]])]
+    let generic18: [String: Any] = ["AdapterVoltage": 12000, "Watts": 18, "Current": 1500,
+                                    "UsbHvcMenu": menu([[5000, 3000], [9000, 2000], [12000, 1500]])]
+    let phone15: [String: Any] = ["Voltage": 5000, "Watts": 15, "Current": 3000] // older macOS name for the voltage
+
+    // Ugreen right after plug-in: macOS hasn't started using it, so the draining battery isn't its fault.
+    let waiting = reading(battery(amps: -515, adapter: ugreen30))
+    precondition(waiting.contractText == "30W (20V × 1.5A)", "contract")
+    precondition(waiting.offers.map { "\(fmt($0.volts))V \(fmt($0.amps))A" } == ["5V 3A", "9V 3A", "12V 2.5A", "15V 2A", "20V 1.5A"], "offers")
+    precondition(waiting.battAmps == -0.515 && waiting.issues.isEmpty, "signed amps, no drain warning before power flows")
+    let charging = reading(battery(amps: 1572, vin: 19530, iin: 1443, adapter: ugreen30))
+    precondition(charging.liveText == "28.2W (19.5V × 1.44A)" && charging.issues.isEmpty, "30W charging is fine")
+
+    precondition(reading(battery(amps: 426, vin: 11526, iin: 1427, adapter: generic18)).issues.map(\.id) == ["lowwatt"], "18W is low")
+    precondition(reading(battery(amps: -506, vin: 5000, iin: 2000, adapter: phone15)).issues.map(\.id) == ["5v", "drain"], "5V and drain")
+    precondition(reading(battery(amps: 1000, vin: 22600, iin: 1000, adapter: ugreen30)).issues.first?.id == "overvolt", "overvoltage")
+    precondition(reading(battery(amps: 1000, vin: 16000, iin: 2000, adapter: ugreen30)).issues.map(\.id) == ["sag"], "voltage sag")
+    precondition(reading(battery(amps: 1000, adapter: ugreen30), thermal: .serious).issues.map(\.id) == ["hot"], "hot")
+    precondition(reading(battery(amps: -800, adapter: ["FamilyCode": 0], connected: false)).issues.isEmpty, "on battery: no charger rules")
+
+    // A warning is confirmed after 4 s and notified once.
+    var alerts = ChargerAlerts()
+    let t0 = Date(timeIntervalSince1970: 1000)
+    var r = reading(battery(amps: 1000, vin: 5000, iin: 2900, adapter: phone15))
+    precondition(alerts.update(&r, now: t0).isEmpty && alerts.pending, "waits before warning")
+    precondition(alerts.update(&r, now: t0 + 5).map(\.id) == ["5v"] && !alerts.pending, "warns once confirmed")
+    precondition(alerts.update(&r, now: t0 + 10).isEmpty && alerts.active.map(\.id) == ["5v"], "no repeat")
+
+    // Swapping to a 5V charger while macOS still reports the old 20V reading must not look like overvoltage.
+    alerts = ChargerAlerts()
+    r = reading(battery(amps: 1000, vin: 19900, iin: 1000, adapter: ugreen30, updated: 990))
+    _ = alerts.update(&r, now: t0)
+    precondition(r.liveText != nil, "plugged in at launch: reading is current")
+    for i in 1...3 {
+        r = reading(battery(amps: 1000, vin: 19900, iin: 1000, adapter: phone15, updated: 990))
+        _ = alerts.update(&r, now: t0 + Double(i) * 5)
+        precondition(r.liveText == nil && !alerts.active.contains { $0.id == "overvolt" }, "stale reading ignored")
+    }
+    r = reading(battery(amps: 1000, vin: 5100, iin: 2900, adapter: phone15, updated: 1030))
+    _ = alerts.update(&r, now: t0 + 35)
+    precondition(r.liveText == "14.8W (5.1V × 2.9A)", "fresh reading used")
+
+    // Three plug-ins within a minute.
+    alerts = ChargerAlerts()
+    let on = reading(battery(amps: 1000, adapter: ugreen30)), off = reading(battery(amps: -500, adapter: [:], connected: false))
+    var warned: [String] = []
+    for i in 0..<10 {
+        r = i % 2 == 0 ? on : off
+        warned += alerts.update(&r, now: t0 + Double(i) * 3).map(\.id)
+    }
+    precondition(warned == ["flapping"], "flapping charger")
+
+    precondition(fmt(20) == "20" && fmt(3.25) == "3.25" && fmt(0.5) == "0.5" && fmt(19.85, 1) == "19.9" && fmt(-0.001, 1) == "0", "fmt")
 }
 
 switch CommandLine.arguments.dropFirst().first {
